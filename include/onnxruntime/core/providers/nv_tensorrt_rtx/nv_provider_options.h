@@ -16,8 +16,6 @@
  * - `kProfilesOptShapes`: Specifies the optimal shapes for profiling.
  * - `kCudaGraphEnable`: Enables or disables CUDA graph optimizations.
  * - `kBuilderOptimizationLevel`: Sets the TensorRT builder optimization level (0-5).
- * - `kONNXBytestream`: Specifies the ONNX model as a bytestream.
- * - `kONNXBytestreamSize`: Specifies the size of the ONNX bytestream.
  * - `kEngineCacheEnable`: Enables or disables engine caching.
  * - `kEngineCachePath`: Specifies the path for engine cache storage.
  * - `kEngineCachePrefix`: Specifies a prefix for engine cache files.
@@ -27,6 +25,12 @@
  * - `kEngineDecryptionEnable`: Enables or disables engine decryption.
  * - `kEngineDecryptionLibPath`: Specifies the path to the engine decryption library.
  * - `kForceSequentialEngineBuild`: Forces sequential engine building.
+ * - `kWeightStrippedEngineEnable`: Enables or disables weight-stripped engine building.
+ * - `kOnnxModelFolderPath`: Specifies the folder path for the ONNX model containing weights.
+ * - `kONNXBytestream`: Specifies the ONNX model bytestream pointer for weight stripping.
+ * - `kONNXBytestreamSize`: Specifies the size of the ONNX model bytestream.
+ * - `kExternalDataBytestream`: Specifies external weight data bytestream pointer.
+ * - `kExternalDataBytestreamSize`: Specifies the size of external weight data bytestream.
  */
 namespace onnxruntime {
 namespace nv {
@@ -58,6 +62,8 @@ constexpr const char* kWeightStrippedEngineEnable = "nv_weight_stripped_engine_e
 constexpr const char* kOnnxModelFolderPath = "nv_onnx_model_folder_path";
 constexpr const char* kONNXBytestream = "nv_onnx_bytestream";
 constexpr const char* kONNXBytestreamSize = "nv_onnx_bytestream_size";
+constexpr const char* kExternalDataBytestream = "nv_external_data_bytestream";
+constexpr const char* kExternalDataBytestreamSize = "nv_external_data_bytestream_size";
 
 }  // namespace provider_option_names
 namespace run_option_names {

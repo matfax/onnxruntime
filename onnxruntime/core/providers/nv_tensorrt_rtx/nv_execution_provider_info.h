@@ -41,7 +41,7 @@ struct NvExecutionProviderInfo {
   bool detailed_build_log{false};
   bool sparsity_enable{false};
   int auxiliary_streams{-1};
-  int builder_optimization_level{4};
+  int builder_optimization_level{TRT_DEFAULT_OPTIMIZER_LEVEL};
   std::string extra_plugin_lib_paths{""};
   std::string profile_min_shapes{""};
   std::string profile_max_shapes{""};

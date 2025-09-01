@@ -54,6 +54,10 @@ constexpr const char* kForceTimingCacheMatch = "nv_force_timing_cache";
 constexpr const char* kEngineDecryptionEnable = "nv_engine_decryption_enable";
 constexpr const char* kEngineDecryptionLibPath = "nv_engine_decryption_lib_path";
 constexpr const char* kForceSequentialEngineBuild = "nv_force_sequential_engine_build";
+constexpr const char* kWeightStrippedEngineEnable = "nv_weight_stripped_engine_enable";
+constexpr const char* kOnnxModelFolderPath = "nv_onnx_model_folder_path";
+constexpr const char* kONNXBytestream = "nv_onnx_bytestream";
+constexpr const char* kONNXBytestreamSize = "nv_onnx_bytestream_size";
 
 }  // namespace provider_option_names
 namespace run_option_names {

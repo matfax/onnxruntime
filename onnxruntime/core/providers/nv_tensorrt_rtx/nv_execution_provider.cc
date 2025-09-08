@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <filesystem>
+#include <thread>
 // TODO: find a better way to share this
 #include "core/providers/cuda/cuda_stream_handle.h"
 
@@ -1016,7 +1017,12 @@ NvExecutionProvider::NvExecutionProvider(const NvExecutionProviderInfo& info)
   ep_context_file_path_ = info.ep_context_file_path;
   ep_context_embed_mode_ = info.ep_context_embed_mode;
   enable_engine_cache_for_ep_context_model();
+  engine_cache_enable_ = info.engine_cache_enable;
+  cache_path_ = info.engine_cache_path;
   cache_prefix_ = info.engine_cache_prefix;
+  timing_cache_enable_ = info.timing_cache_enable;
+  timing_cache_path_ = info.timing_cache_path;
+  force_timing_cache_ = info.force_timing_cache;
   // use a more global cache if given
   engine_decryption_enable_ = info.engine_decryption_enable;
   if (engine_decryption_enable_) {
@@ -1025,6 +1031,7 @@ NvExecutionProvider::NvExecutionProvider(const NvExecutionProviderInfo& info)
   force_sequential_engine_build_ = info.force_sequential_engine_build;
   sparsity_enable_ = info.sparsity_enable;
   auxiliary_streams_ = info.auxiliary_streams;
+  builder_optimization_level_ = info.builder_optimization_level;
   profile_min_shapes = info.profile_min_shapes;
   profile_max_shapes = info.profile_max_shapes;
   profile_opt_shapes = info.profile_opt_shapes;
@@ -2307,7 +2314,7 @@ common::Status NvExecutionProvider::RefitEngine(std::string onnx_model_filename,
         } else if (proto.has_raw_data()) {
           auto& raw_data = proto.raw_data();
           names.push_back(proto.name());
-          bytes.push_back(raw_data.c_str());
+          bytes.push_back(raw_data.data());
           sizes.push_back(raw_data.size());
         } else {
           LOGS_DEFAULT(WARNING) << "[NvTensorRTRTX EP] Proto: " + proto_name + " has no raw nor external data.";
@@ -2589,6 +2596,23 @@ Status NvExecutionProvider::CreateNodeComputeInfoFromGraph(const GraphViewer& gr
     trt_config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kTACTIC_SHARED_MEMORY, max_shared_mem_size_);
   }
 
+  // Set builder optimization level
+#if TRT_MAJOR_RTX > 1 || (TRT_MAJOR_RTX == 1 && TRT_MINOR_RTX >= 1)
+  if (builder_optimization_level_ != 3) {
+    if (builder_optimization_level_ < 0 || builder_optimization_level_ > 5) {
+      LOGS_DEFAULT(WARNING) << "[NvTensorRTRTX EP] Invalid builder optimization level " << builder_optimization_level_
+                           << ". Valid range is [0-5]. Using default level 3.";
+    } else {
+      trt_config->setBuilderOptimizationLevel(builder_optimization_level_);
+      LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Builder optimization level is set to " << builder_optimization_level_;
+    }
+  }
+#else
+  if (builder_optimization_level_ != 3) {
+    LOGS_DEFAULT(WARNING) << "[NvTensorRTRTX EP] Builder optimization level can only be used on TensorRT RTX 1.1 onwards!";
+  }
+#endif
+
   // Only set compute capability for Turing
   const std::string kTuringComputeCapability{"75"};
 
@@ -2782,20 +2806,168 @@ Status NvExecutionProvider::CreateNodeComputeInfoFromGraph(const GraphViewer& gr
   }
   {
     auto lock = GetApiLock();
-    // Build engine
+
+    // Load timing cache from file if enabled
+    std::unique_ptr<nvinfer1::ITimingCache> timing_cache = nullptr;
+    if (timing_cache_enable_ && !timing_cache_path_.empty()) {
+      std::vector<char> loaded_timing_cache = loadTimingCacheFile(timing_cache_path_);
+      if (!loaded_timing_cache.empty()) {
+        timing_cache.reset(trt_config->createTimingCache(static_cast<const void*>(loaded_timing_cache.data()), loaded_timing_cache.size()));
+        if (timing_cache == nullptr) {
+          return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                                 "NvTensorRTRTX EP failed to create timing cache from file: " + timing_cache_path_ + ". Cache file may be corrupted or incompatible.");
+        }
+        trt_config->setTimingCache(*timing_cache, force_timing_cache_);
+        if (detailed_build_log_) {
+          LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Loaded timing cache from " + timing_cache_path_;
+        }
+      } else {
+        // Create empty timing cache for first run - TensorRT will populate it during build
+        timing_cache.reset(trt_config->createTimingCache(nullptr, 0));
+        if (timing_cache == nullptr) {
+          return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                                 "NvTensorRTRTX EP failed to create empty timing cache.");
+        }
+        trt_config->setTimingCache(*timing_cache, force_timing_cache_);
+        if (detailed_build_log_) {
+          LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Created empty timing cache for " + timing_cache_path_;
+        }
+      }
+    }
+
+    // Construct engine cache path
+    std::string engine_cache_path = "";
+    if (engine_cache_enable_ && !cache_path_.empty()) {
+      if (!cache_prefix_.empty()) {
+        engine_cache_path = GetCachePath(cache_path_, cache_prefix_) + fused_node.Name() + ".engine";
+      } else {
+        engine_cache_path = GetCachePath(cache_path_, fused_node.Name()) + ".engine";
+      }
+    }
+
+    // Try to load engine from cache first
+    std::vector<char> loaded_engine_data;
+    bool engine_loaded_from_cache = false;
+    if (engine_cache_enable_ && !engine_cache_path.empty()) {
+      loaded_engine_data = loadEngine(engine_cache_path);
+      if (!loaded_engine_data.empty()) {
+        // Validate profile compatibility if dynamic shapes are used
+        bool profile_compatible = true;
+        if (has_explicit_profile && !profile_min_shapes_.empty()) {
+          // Check if profile file exists and compare profiles
+          std::string profile_cache_path = engine_cache_path + ".profile";
+          if (std::filesystem::exists(profile_cache_path)) {
+            // CompareProfiles returns true if profiles differ (need rebuild), false if same
+            profile_compatible = !CompareProfiles(profile_cache_path, profile_min_shapes_, profile_max_shapes_, profile_opt_shapes_);
+            if (!profile_compatible && detailed_build_log_) {
+              LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Cached engine profile mismatch, rebuilding engine: " + engine_cache_path;
+            }
+          } else {
+            // No profile file found, assume incompatible for safety
+            profile_compatible = false;
+            if (detailed_build_log_) {
+              LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] No profile file found for cached engine, rebuilding: " + engine_cache_path;
+            }
+          }
+        }
+
+        if (profile_compatible) {
+          engine_loaded_from_cache = true;
+          if (detailed_build_log_) {
+            LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Loaded engine from cache: " + engine_cache_path + " (" + std::to_string(loaded_engine_data.size()) + " bytes)";
+          }
+        } else {
+          // Clear loaded data since profile is incompatible
+          loaded_engine_data.clear();
+        }
+      }
+    }
+
+    // Build engine or use cached engine
+    std::unique_ptr<nvinfer1::IHostMemory> serialized_engine;
     std::chrono::steady_clock::time_point engine_build_start;
-    if (detailed_build_log_) {
-      engine_build_start = std::chrono::steady_clock::now();
+    if (engine_loaded_from_cache) {
+      // Use cached engine - create a fake IHostMemory wrapper
+      // We'll deserialize directly from loaded_engine_data below
+      if (detailed_build_log_) {
+        LOGS_DEFAULT(INFO) << "[NvTensorRTRTX EP] Using cached engine for " << fused_node.Name();
+      }
+    } else {
+      // Build new engine
+      if (detailed_build_log_) {
+        engine_build_start = std::chrono::steady_clock::now();
+      }
+      serialized_engine.reset(trt_builder->buildSerializedNetwork(*trt_network, *trt_config));
+      if (serialized_engine == nullptr) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                               "NvTensorRTRTX EP failed to create engine from network for fused node: " + fused_node.Name());
+      }
     }
-    std::unique_ptr<nvinfer1::IHostMemory> serialized_engine{trt_builder->buildSerializedNetwork(*trt_network, *trt_config)};
-    if (serialized_engine == nullptr) {
-      return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
-                             "NvTensorRTRTX EP failed to create engine from network for fused node: " + fused_node.Name());
+
+    // Save timing cache to file if enabled
+    if (timing_cache_enable_ && !timing_cache_path_.empty()) {
+      auto timing_cache = trt_config->getTimingCache();
+      if (timing_cache == nullptr) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                               "NvTensorRTRTX EP: No timing cache available after engine build. This should not happen.");
+      }
+
+      std::unique_ptr<nvinfer1::IHostMemory> timingCacheHostData{timing_cache->serialize()};
+      if (timingCacheHostData == nullptr || timingCacheHostData->size() == 0) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                               "NvTensorRTRTX EP failed to serialize timing cache to: " + timing_cache_path_);
+      }
+
+      saveTimingCacheFile(timing_cache_path_, timingCacheHostData.get());
+
+      // Verify the file was actually written
+      if (!std::filesystem::exists(timing_cache_path_)) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                               "NvTensorRTRTX EP failed to write timing cache file: " + timing_cache_path_);
+      }
+
+      if (detailed_build_log_) {
+        LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Saved timing cache to " + timing_cache_path_ + " (" + std::to_string(timingCacheHostData->size()) + " bytes)";
+      }
     }
-    trt_engine = std::unique_ptr<nvinfer1::ICudaEngine>(runtime_->deserializeCudaEngine(serialized_engine->data(), serialized_engine->size()));
-    if (trt_engine == nullptr) {
-      return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
-                             "NvTensorRTRTX EP failed to deserialize engine for fused node: " + fused_node.Name());
+
+    // Save engine cache to file if enabled and engine was built (not loaded from cache)
+    if (!engine_loaded_from_cache && engine_cache_enable_ && !engine_cache_path.empty() && serialized_engine != nullptr) {
+      try {
+        // Save engine directly from serialized data (more efficient)
+        saveEngine(serialized_engine.get(), engine_cache_path);
+
+        // Save profile file if dynamic shapes are used
+        if (has_explicit_profile && !input_explicit_shape_ranges.empty()) {
+          std::string profile_cache_path = engine_cache_path + ".profile";
+          SerializeProfileV2(profile_cache_path, input_explicit_shape_ranges);
+          if (detailed_build_log_) {
+            LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Saved profile to cache: " + profile_cache_path;
+          }
+        }
+
+        if (detailed_build_log_) {
+          LOGS_DEFAULT(VERBOSE) << "[NvTensorRTRTX EP] Saved engine to cache: " + engine_cache_path + " (" + std::to_string(serialized_engine->size()) + " bytes)";
+        }
+      } catch (const std::exception& e) {
+        // Log error but don't fail - engine caching is not critical
+        LOGS_DEFAULT(WARNING) << "[NvTensorRTRTX EP] Failed to save engine cache: " << e.what();
+      }
+    }
+
+    // Deserialize engine (either from cache or newly built)
+    if (engine_loaded_from_cache) {
+      trt_engine = std::unique_ptr<nvinfer1::ICudaEngine>(runtime_->deserializeCudaEngine(loaded_engine_data.data(), loaded_engine_data.size()));
+      if (trt_engine == nullptr) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                               "NvTensorRTRTX EP failed to deserialize cached engine for fused node: " + fused_node.Name() + ". Cache may be corrupted.");
+      }
+    } else {
+      trt_engine = std::unique_ptr<nvinfer1::ICudaEngine>(runtime_->deserializeCudaEngine(serialized_engine->data(), serialized_engine->size()));
+      if (trt_engine == nullptr) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
+                               "NvTensorRTRTX EP failed to deserialize engine for fused node: " + fused_node.Name());
+      }
     }
 
     trt_runtime_config = std::unique_ptr<nvinfer1::IRuntimeConfig>(trt_engine->createRuntimeConfig());
@@ -2816,7 +2988,7 @@ Status NvExecutionProvider::CreateNodeComputeInfoFromGraph(const GraphViewer& gr
       }
     }
 
-    if (detailed_build_log_) {
+    if (detailed_build_log_ && !engine_loaded_from_cache) {
       auto engine_build_stop = std::chrono::steady_clock::now();
       LOGS_DEFAULT(INFO) << "TensorRT engine build for " << fused_node.Name() << " took: " << std::chrono::duration_cast<std::chrono::milliseconds>(engine_build_stop - engine_build_start).count() << "ms" << std::endl;
     }
@@ -2829,10 +3001,8 @@ Status NvExecutionProvider::CreateNodeComputeInfoFromGraph(const GraphViewer& gr
       if (!cache_prefix_.empty()) {
         // Generate cache suffix in case user would like to customize cache prefix
         cache_path = GetCachePath(cache_path_, cache_prefix_) + fused_node.Name() + ".engine";
-        ;
       } else {
         cache_path = GetCachePath(cache_path_, fused_node.Name()) + ".engine";
-        ;
       }
       // NV TRT EP per default generates hardware compatible engines for any RTX device with compute capability > 80
       std::string compute_capability_hw_compat = "80+";
@@ -2840,11 +3010,22 @@ Status NvExecutionProvider::CreateNodeComputeInfoFromGraph(const GraphViewer& gr
         ep_context_model_ = Model::Create("nv_trt_rtx_ep_context_model", false, *GetLogger());
       }
 
+      // Use appropriate engine data for EP context model
+      const char* engine_data = nullptr;
+      size_t engine_size = 0;
+      if (engine_loaded_from_cache) {
+        engine_data = loaded_engine_data.data();
+        engine_size = loaded_engine_data.size();
+      } else {
+        engine_data = reinterpret_cast<char*>(serialized_engine->data());
+        engine_size = serialized_engine->size();
+      }
+
       auto status = CreateCtxNode(graph_body_viewer,
                                   ep_context_model_->MainGraph(),
                                   cache_path,
-                                  reinterpret_cast<char*>(serialized_engine->data()),
-                                  serialized_engine->size(),
+                                  const_cast<char*>(engine_data),
+                                  engine_size,
                                   ep_context_embed_mode_,
                                   compute_capability_hw_compat,
                                   model_path_,

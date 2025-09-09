@@ -38,6 +38,7 @@ struct NvExecutionProviderInfo {
   bool engine_decryption_enable{false};
   std::string engine_decryption_lib_path{""};
   bool force_sequential_engine_build{false};
+  std::string runtime_cache_path{""};
   bool timing_cache_enable{false};
   std::string timing_cache_path{""};
   bool force_timing_cache{false};

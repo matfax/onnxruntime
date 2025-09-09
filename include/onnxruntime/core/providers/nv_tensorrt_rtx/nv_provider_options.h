@@ -49,6 +49,7 @@ constexpr const char* kCudaGraphEnable = "enable_cuda_graph";
 constexpr const char* kBuilderOptimizationLevel = "nv_builder_optimization_level";
 constexpr const char* kMultiProfileEnable = "nv_multi_profile_enable";
 constexpr const char* kUseExternalDataInitializer = "nv_use_external_data_initializer";
+constexpr const char* kRuntimeCacheFile = "nv_runtime_cache_path";
 constexpr const char* kEngineCacheEnable = "nv_engine_cache_enable";
 constexpr const char* kEngineCachePath = "nv_engine_cache_path";
 constexpr const char* kEngineCachePrefix = "nv_engine_cache_prefix";

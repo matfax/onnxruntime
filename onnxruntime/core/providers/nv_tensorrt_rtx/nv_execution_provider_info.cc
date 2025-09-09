@@ -61,6 +61,7 @@ NvExecutionProviderInfo NvExecutionProviderInfo::FromProviderOptions(const Provi
           .AddAssignmentToReference(nv::provider_option_names::kBuilderOptimizationLevel, info.builder_optimization_level)
           .AddAssignmentToReference(nv::provider_option_names::kUseExternalDataInitializer, info.use_external_data_initializer)
           .AddAssignmentToReference(nv::provider_option_names::kMultiProfileEnable, info.multi_profile_enable)
+          .AddAssignmentToReference(nv::provider_option_names::kRuntimeCacheFile, info.runtime_cache_path)
           .AddAssignmentToReference(nv::provider_option_names::kWeightStrippedEngineEnable, info.weight_stripped_engine_enable)
           .AddAssignmentToReference(nv::provider_option_names::kOnnxModelFolderPath, info.onnx_model_folder_path)
           .AddValueParser(
@@ -144,6 +145,7 @@ ProviderOptions NvExecutionProviderInfo::ToProviderOptions(const NvExecutionProv
       {nv::provider_option_names::kProfilesMaxShapes, MakeStringWithClassicLocale(info.profile_max_shapes)},
       {nv::provider_option_names::kProfilesOptShapes, MakeStringWithClassicLocale(info.profile_opt_shapes)},
       {nv::provider_option_names::kCudaGraphEnable, MakeStringWithClassicLocale(info.cuda_graph_enable)},
+      {nv::provider_option_names::kRuntimeCacheFile, MakeStringWithClassicLocale(info.runtime_cache_path)}};
       {nv::provider_option_names::kBuilderOptimizationLevel, MakeStringWithClassicLocale(info.builder_optimization_level)},
       {nv::provider_option_names::kUseExternalDataInitializer, MakeStringWithClassicLocale(info.use_external_data_initializer)},
       {nv::provider_option_names::kMultiProfileEnable, MakeStringWithClassicLocale(info.multi_profile_enable)},
